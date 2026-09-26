@@ -1,0 +1,75 @@
+name: Uptime
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # every 5 minutes (GitHub may run a few minutes late)
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # the monthly keep-alive commit
+  issues: write     # open / close the "down" issue
+
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check book.djmoblvd.com
+        id: check
+        run: |
+          check() {
+            ping=$(curl -s -o /dev/null -w "%{http_code}" --max-time 20 https://book.djmoblvd.com/api/ping)
+            page=$(curl -s -o /dev/null -w "%{http_code}" --max-time 20 https://book.djmoblvd.com/inquire)
+            echo "api/ping=$ping inquire=$page"
+            [ "$ping" = "204" ] && [ "$page" = "200" ]
+          }
+          for try in 1 2 3; do
+            if check; then echo "up=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+            sleep 20
+          done
+          echo "up=false" >> "$GITHUB_OUTPUT"
+
+      - name: Open an issue when it's down
+        if: steps.check.outputs.up == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          open=$(gh issue list --state open --label down --json number --jq 'length')
+          if [ "$open" = "0" ]; then
+            gh label create down --color B60205 --force >/dev/null
+            gh issue create --label down --title "book.djmoblvd.com is down" \
+              --body "Encore didn't answer three checks in a row at $(date -u '+%Y-%m-%d %H:%M UTC'). Check https://book.djmoblvd.com and https://fly.io/apps/encore-djmoblvd/monitoring."
+          fi
+          exit 1
+
+      - name: Close the issue when it's back
+        if: steps.check.outputs.up == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          for n in $(gh issue list --state open --label down --json number --jq '.[].number'); do
+            gh issue close "$n" --comment "Back up at $(date -u '+%Y-%m-%d %H:%M UTC')."
+          done
+
+  # GitHub pauses scheduled checks in a repo with no activity for 60 days,
+  # so once a month this records a heartbeat commit.
+  keepalive:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Monthly heartbeat
+        run: |
+          month=$(date -u +%Y-%m)
+          if [ "$(cat heartbeat 2>/dev/null)" != "$month" ]; then
+            echo "$month" > heartbeat
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add heartbeat && git commit -m "Heartbeat $month" && git push
+          fi
